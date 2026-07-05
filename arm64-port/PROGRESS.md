@@ -8,6 +8,19 @@
 
 ## ▶ CURRENT FOCUS
 
+**Host-MMU fastmem for EE load/store** — replace the per-access `vtlb_memRead/Write`
+C-call (`aR5900LoadStore.cpp`, the current path for *every* memory op) with base-relative
+(`x28`) fastmem + SIGSEGV backpatch. Full phased plan in **`arm64-port/FASTMEM_PLAN.md`**
+(ports the memory half of ARMSX2 `ee33d237`). All the shared infra — region reservation,
+RAM mapping, `vtlb_AddLoadStoreInfo`/`vtlb_BackpatchLoadStore`, mach-exception fault
+delivery — already exists and is live on ARM64/macOS; only the emit + `vtlb_DynBackpatchLoadStore`
+thunk are ours to write. **Start at F0** (confirm x28 free + fastmem base allocates).
+
+Just-ported (ARMSX2 `673135b0`, pending build verify): MMI integer MADD/MADDU/MADD1/MADDU1,
+MFHI1/MTHI1/MFLO1/MTLO1, native BC0F/BC0T (+likely) with CPCOND0 DMA-wait idle-skip, and
+the Count/PERF MFC0/MTC0 commit-then-inline (`recCop0NeedsLiveCycle`) replacing their
+single-step. Skipped that commit's EI/ERET rework — we already have `recIsForcedEventTestOp`.
+
 ---
 
 ## Phase 0 — Prerequisites & Tooling
@@ -40,7 +53,25 @@ still defers all real work to the interpreter. ✅ **DONE** (BIOS boot verified)
 ## Phase 2 — vtlb Fast Memory & Load/Store  *(highest priority after skeleton)*
 
 - [x] 2.1 Slow-path vtlb load/store codegen in `pcsx2/arm64/aR5900LoadStore.cpp`: `armEmitVtlbRead/Write` + `...Quad`, emitting calls to the C++ `vtlb_memRead/Write` helpers (interpreter-equivalent path). Builds, links, arm64, unittests green. *(Re-scoped from "implement `vtlb_DynBackpatchLoadStore`" — that is fastmem-only and is now Phase 2.2; see JOURNAL.)*
-- [ ] 2.2 **Fastmem fast path:** implement `vtlb_DynBackpatchLoadStore` in `pcsx2/arm64/RecStubs.cpp` (currently `pxFailRel`) + the direct `REFASTMEMBASE`-relative load/store emit + `vtlb_AddLoadStoreInfo`. Single-instruction backpatch (overwrite the faulting op with `B thunk`); thunk does the slow path then branches back. Ref `x86/ix86-32/recVTLB.cpp`.
+- [x] 2.2 **Fastmem fast path:** DONE & user-build-verified (all green), commit `2ff13e033d`. Host-MMU
+  fastmem: a single `RFASTMEMBASE`(x28)-relative `Ldr`/`Str` on the hot path + SIGSEGV backpatch to the
+  slow vtlb helper for MMIO/handler pages. Ported the memory half of ARMSX2 `ee33d237` (jpolo1224) onto our
+  EE rec — plan in `arm64-port/FASTMEM_PLAN.md` (F0–F5). All behind `CHECK_FASTMEM` + an `s_eeFastmemBackpatch`
+  toggle; the inline vmap path (`REVTLBPTR`=x21) is retained as the fallback for faulting PCs / fastmem-off.
+  - **F1** `armEmitJmpPtr` (`AsmHelpers.{cpp,h}`) — W^X-safe in-place overwrite of one instruction with a
+    `B imm26` (`BeginCodeWrite`/memcpy/`EndCodeWrite`/`FlushInstructionCache`). gtest `Arm64Emit.JmpPtrInPlacePatch`.
+  - **F2** `vtlb_DynBackpatchLoadStore` in `RecStubs.cpp` (was `pxFailRel`) — thunk redoes the access via
+    `vtlb_memRead/Write<T>` (+ `…128` quads) using the recorded addr/data reg codes, resolves addr/data
+    aliasing, sign/zero-extends loads, resumes after the fault; **no cycle reload** (memory-based cycle model).
+    `recBeginThunk`/`recEndThunk` carve a no-const-pool scratch region from the EE code buffer.
+  - **F3** emit-side fastmem in all four `recTryTranslateCached{Load,Store}{,Quad}` + `armTryEmitFastmemScalar32`;
+    threaded guest `pc` through `recTranslateOp`/`recTranslateOpOptimized`/`recEmitOp`/`recTryTranslateCachedOp`;
+    x28 pinned at both dispatcher funnels under `CHECK_FASTMEM`; `vtlb_ClearLoadStoreInfo()` in `recResetRaw`;
+    one-shot `[FASTMEM F0]` boot log. GPR cache **8→7** (dropped x28 = `RFASTMEMBASE`; x21 kept for the vmap fallback).
+  - **F5** LWC1/SWC1 (`aR5900FPU.cpp`) take `pc` + route through `armTryEmitFastmemScalar32`.
+  - Deliberately **NOT** ported from `ee33d237`: direct block chaining (we have recLUT 4.4) and the fast-tier
+    register cache (we use x20). Remaining: **F6** SMC/invalidation interaction verify + **F7** perf gate
+    (EE-fallback% and fps, fastmem on vs off) — see FASTMEM_PLAN.md.
 - [x] 2.3 EE load/store opcode generators: decode + guest-GPR access wired onto `armEmitVtlbRead/Write[Quad]`. `armEmitEffectiveAddr`/`armEmitLoadGpr`/`armEmitStoreGpr` + the 128-bit `armEmitLoadQuad`/`armEmitStoreQuad` (`~0xF` align + NEON q access). `recTranslateOp` dispatches the full aligned family: `LB/LBU/LH/LHU/LW/LWU/LD`, `SB/SH/SW/SD`, `LQ/SQ`. Unaligned `LWL/LWR/LDL/LDR`/`SWL/SWR/SDL/SDR` deferred (byte-merge codegen). Runtime-proven addr+align via 7 `Arm64EmitEE.*` gtests.
 - [x] 2.4 Test: full guest-memory round-trip through the scalar + quad generators. 6 new `Arm64EmitEE.*` gtests map a host buffer into the vtlb `vmap` (hand-built direct-pointer entry — no SysMemory/fastmem/page-fault-handler needed since default `EmuConfig` makes `vtlb_memRead/Write` a plain `*vmap[addr>>12].assumePtr(addr)`) and assert store→load, byte sign/zero-extend, doubleword, `$zero`-discard, and quad store/load + align-down all read/write the right bytes. Validates address calc + AAPCS64 marshalling + extension end-to-end.
 
@@ -54,7 +85,7 @@ still defers all real work to the interpreter. ✅ **DONE** (BIOS boot verified)
 - [x] 3.2 Reg-reg ops: `ADD/ADDU/SUB/SUBU/SLT/SLTU/AND/OR/XOR/NOR/DADD/DADDU/DSUB/DSUBU`.
 - [x] 3.3 Shifts: `SLL/SRL/SRA/SLLV/SRLV/SRAV/DSLLV/DSRLV/DSRAV/DSLL/DSRL/DSRA/DSLL32/DSRL32/DSRA32`.
 - [x] 3.4 Moves: `MOVZ/MOVN` (→ `CSEL`), `MFHI/MTHI/MFLO/MTLO`.
-- [x] 3.5 Mul/Div: `MULT/MULTU/DIV/DIVU` (+ MMI `MULT1/MULTU1/DIV1/DIVU1` → HI1/LO1). Uses `SMULL/UMULL` (32×32→64) and `SDIV/UDIV` + reload-based remainder. ARM `SDIV` reproduces the EE overflow quirk natively; only ÷0 needs a fixup. MULT/MULTU honour the R5900 3-operand `Rd=LO` write.
+- [x] 3.5 Mul/Div: `MULT/MULTU/DIV/DIVU` (+ MMI `MULT1/MULTU1/DIV1/DIVU1` → HI1/LO1). Uses `SMULL/UMULL` (32×32→64) and `SDIV/UDIV` + reload-based remainder. ARM `SDIV` reproduces the EE overflow quirk natively; only ÷0 needs a fixup. MULT/MULTU honour the R5900 3-operand `Rd=LO` write. **MMI multiply-accumulate `MADD/MADDU/MADD1/MADDU1` + pipeline-1 moves `MFHI1/MTHI1/MFLO1/MTLO1`** added (`aR5900MultDiv.cpp`, ARMSX2 `673135b0`); accumulator held in x17 across the widening multiply.
 - [ ] 3.6 Constant propagation (`EE_CONST_PROP`): track known-constant GPRs, emit immediate forms.
 
 ---
@@ -66,7 +97,11 @@ still defers all real work to the interpreter. ✅ **DONE** (BIOS boot verified)
 - [~] 4.2 Conditional branches: `BEQ/BNE/BLEZ/BGTZ/BLTZ/BGEZ/BLTZAL/BGEZAL` —
   codegen + wired (`recEmitBranch`). "Likely" variants (BEQL/BNEL/BLEZL/BGTZL/
   BLTZL/BGEZL/BLTZALL/BGEZALL — delay-slot nullification) run via interpreter
-  fallback for now; native codegen still TODO.
+  fallback for now; native codegen still TODO. **COP0 `BC0F/BC0T` (+ likely
+  `BC0FL/BC0TL`) native** via CPCOND0 (DMAC STAT/PCR) test — `armEmitBC0F/T`,
+  `emitCpcond0Test` in `aR5900Branch.cpp`; wired into `recEmitBranch`/
+  `recIsHandledBranch`/`recIsLikelyBranch`; `recBranchConditionReads`→0 so the
+  DMA-wait spin idle-skips via the wait-loop fast-forward (ARMSX2 `673135b0`).
 - [x] 4.3 **Dispatcher + delay-slot block compiler** — DONE & BIOS-boot verified.
   Multi-instruction `recCompileBlock`; branch generator + delay slot + exit; C++
   dispatcher loop in `recExecute` (pc→block→`_cpuEventTest_Shared`); per-opcode
