@@ -134,6 +134,26 @@ namespace dyn_shaderc
 
 bool dyn_shaderc::Open()
 {
+#ifdef PCSX2_STATIC_SHADERC
+	// statically linked: bind the function table straight to the symbols
+	if (s_compiler)
+		return true;
+
+#define BIND_FUNC(F) F = &::F;
+	SHADERC_FUNCTIONS(BIND_FUNC)
+#undef BIND_FUNC
+
+	s_compiler = shaderc_compiler_initialize();
+	if (!s_compiler)
+	{
+		ERROR_LOG("shaderc_compiler_initialize() failed");
+		Close();
+		return false;
+	}
+
+	std::atexit(&dyn_shaderc::Close);
+	return true;
+#else
 	if (s_library.IsOpen())
 		return true;
 
@@ -147,8 +167,20 @@ bool dyn_shaderc::Open()
 #endif
 	if (!s_library.Open(libname.c_str(), &error))
 	{
-		ERROR_LOG("Failed to load shaderc: {}", error.GetDescription());
-		return false;
+#ifndef _WIN32
+		// Distro packages (e.g. Ubuntu's libshaderc) ship the library as
+		// libshaderc.so.1 instead of libshaderc_shared.so.1.
+		const std::string distro_libname = DynamicLibrary::GetVersionedFilename("shaderc", 1);
+		if (s_library.Open(distro_libname.c_str(), &error))
+		{
+			INFO_LOG("Loaded distro shaderc library: {}", distro_libname);
+		}
+		else
+#endif
+		{
+			ERROR_LOG("Failed to load shaderc: {}", error.GetDescription());
+			return false;
+		}
 	}
 
 #define LOAD_FUNC(F) \
@@ -172,6 +204,7 @@ bool dyn_shaderc::Open()
 
 	std::atexit(&dyn_shaderc::Close);
 	return true;
+#endif
 }
 
 void dyn_shaderc::Close()
